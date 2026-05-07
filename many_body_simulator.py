@@ -96,12 +96,6 @@ def make_lattice(kind, params, pbc=True):
         positions = {i: (float(i), 0.0) for i in range(N)}
         return N, bonds, positions
 
-    if kind == "Triangle (3 sites)":
-        N = 3
-        bonds = [(0, 1), (1, 2), (0, 2)]
-        positions = {0: (0, 0), 1: (1, 0), 2: (0.5, np.sqrt(3) / 2)}
-        return N, bonds, positions
-
     if kind == "2D Square":
         Lx = int(params['Lx']); Ly = int(params['Ly'])
         N = Lx * Ly
@@ -311,16 +305,17 @@ if mode == "Phase 1: Heisenberg model":
     st.sidebar.subheader("Lattice")
     lattice_kind = st.sidebar.selectbox(
         "Geometry",
-        ["1D Chain", "Triangle (3 sites)", "2D Square"],
+        ["1D Chain", "2D Square"],
     )
     lattice_params = {}
     pbc = True
     if lattice_kind == "1D Chain":
-        lattice_params['N'] = st.sidebar.slider("N (sites)", 2, 18, 8)
+        lattice_params['N'] = st.sidebar.slider("N (sites)", 4, 18, 8)
         pbc = st.sidebar.checkbox("Periodic boundary conditions", True)
     elif lattice_kind == "2D Square":
-        lattice_params['Lx'] = st.sidebar.slider("Lx", 2, 5, 2)
-        lattice_params['Ly'] = st.sidebar.slider("Ly", 2, 5, 2)
+        lattice_params['Lx'] = st.sidebar.slider("Lx", 2, 5, 4,
+            help="2x2 is kept for validating your analytical 1.2 result.")
+        lattice_params['Ly'] = st.sidebar.slider("Ly", 2, 5, 4)
         pbc = st.sidebar.checkbox("Periodic boundary conditions", True)
 
     N_preview, bonds_preview, _ = make_lattice(lattice_kind, lattice_params, pbc)
