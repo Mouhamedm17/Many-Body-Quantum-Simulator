@@ -170,17 +170,24 @@ def ground_state_curve(N, sector_eigs, H_array):
 #   length    : a_ho_B = √(ℏ/m_Bω_B)
 #   energy    : ℏω_B
 #   density   : 1/a_ho_B³
+#
 # Inputs:
 #   gB           = 4π a_B/a_ho_B                              (boson-boson)
 #   gBF          = 2π a_BF/a_ho_B · m_B/μ                     (boson-fermion)
 #   mass_ratio   = m_F/m_B
 #   omega_ratio  = ω_F/ω_B
+#
 # Equations solved self-consistently:
 #   n_B(r) = max( [μ_B − V_B(r) − gBF n_F(r)] / gB , 0 )                (TF)
 #   n_F(r) = (1/6π²)·[ 2(m_F/m_B)·(μ_F − V_F(r) − gBF n_B(r)) ]^{3/2}   (LDA)
 #   ∫4πr² n_B dr = N_B,  ∫4πr² n_F dr = N_F
 #
 # V_B(r) = ½ r²,   V_F(r) = ½ (m_F/m_B)(ω_F/ω_B)² r²
+#
+# Note: the field Ψ_F is treated as spinless (one component per site),
+# matching the project's E_F = ℏ²(6π² n_F)^{2/3}/(2m_F).  The trapped
+# spinless 3D-HO non-interacting chemical potential is therefore
+# μ_F = ℏω_F (6 N_F)^{1/3}, *not* (3 N_F)^{1/3}.
 
 def boson_density(mu_B, n_F, V_B, gB, gBF):
     return np.maximum((mu_B - V_B - gBF * n_F) / gB, 0.0)
@@ -189,6 +196,8 @@ def boson_density(mu_B, n_F, V_B, gB, gBF):
 def fermion_density(mu_F, n_B, V_F, mass_ratio, gBF):
     arg = 2.0 * mass_ratio * (mu_F - V_F - gBF * n_B)
     arg = np.maximum(arg, 0.0)
+    # Cap to avoid overflow of arg**1.5 in a runaway iteration
+    arg = np.minimum(arg, 1e20)
     return (1.0 / (6.0 * np.pi ** 2)) * arg ** 1.5
 
 
@@ -202,80 +211,134 @@ def integrate_radial(profile, r):
 
 def find_mu(target_N, density_fn, *args):
     """Bisect on chemical potential so total particle number matches `target_N`.
-    `density_fn(mu, *args)` must return a 1-D density array on the radial grid."""
-    r = args[-1]                                              # last arg is r-grid
+    `density_fn(mu, *args[:-1])` returns a 1-D density array on the radial grid `r`
+    (the last argument)."""
+    r = args[-1]
+    fn_args = args[:-1]
 
     def shortfall(mu):
-        n = density_fn(mu, *args[:-1])
+        n = density_fn(mu, *fn_args)
+        if not np.all(np.isfinite(n)):
+            return np.inf  # treat blow-up as "way too big"
         return integrate_radial(n, r) - target_N
 
-    lo, hi = -50.0, 1.0
-    while shortfall(hi) < 0 and hi < 1e6:
+    # Find a bracket [lo, hi] where shortfall changes sign.
+    # At very negative μ, the density is zero everywhere → shortfall ≈ −target_N < 0.
+    # At very positive μ, the integral grows → shortfall → +∞ > 0.
+    lo, hi = -100.0, 1.0
+    for _ in range(80):  # at most ~80 doublings is plenty
+        if shortfall(hi) >= 0:
+            break
         hi *= 2.0
-    while shortfall(lo) > 0 and lo > -1e6:
-        lo *= 2.0
+        if hi > 1e10:
+            break
+    else:
+        return hi  # could not bracket; return huge μ
+
+    if shortfall(lo) > 0:
+        # Density at very negative μ is supposed to be 0; if not, give up softly.
+        return lo
+
     try:
-        return brentq(shortfall, lo, hi, xtol=1e-8, rtol=1e-6)
-    except ValueError:                                         # numerical edge
+        return brentq(shortfall, lo, hi, xtol=1e-9, rtol=1e-7, maxiter=200)
+    except (ValueError, RuntimeError):
         return hi
 
 
-def solve_bf_mixture(NB, NF, gB, gBF, mass_ratio=1.0, omega_ratio=1.0,
-                     r_max=None, n_grid=1000, mixing=0.4, max_iter=400, tol=1e-7):
-    """Self-consistent Thomas-Fermi + LDA solution for the trapped mixture."""
+def cloud_radius(n, r):
+    """Outermost grid point where the density is still appreciable."""
+    n_max = float(np.nanmax(n)) if np.any(np.isfinite(n)) else 0.0
+    if n_max <= 0:
+        return 0.0
+    idxs = np.where(n > 1e-6 * n_max)[0]
+    return float(r[idxs[-1]]) if len(idxs) > 0 else 0.0
 
-    # Estimate a generous radial extent from non-interacting TF radii
+
+def solve_bf_mixture(NB, NF, gB, gBF, mass_ratio=1.0, omega_ratio=1.0,
+                     r_max=None, n_grid=1500, mixing=0.3, max_iter=600, tol=1e-7):
+    """Self-consistent TF (bosons) + LDA (fermions) in a spherical trap.
+
+    Returns a dict with profiles, chemical potentials, and a `status` field
+    that is one of:
+      'converged' — fixed-point reached within `tol`
+      'unconverged' — `max_iter` exhausted without crossing `tol`
+      'collapsed' — densities diverged (mean-field collapse) or
+                    iteration produced NaN/Inf
+    The plotting code uses `status` to keep numeric panels sensible even when
+    the physics is unstable for the chosen parameters.
+    """
+    # --- non-interacting estimates for the radial extent -------------------
     R_B = (15.0 * NB * max(gB, 1e-6) / (4.0 * np.pi)) ** (1.0 / 5.0)
-    mu_F_est = omega_ratio * (3.0 * NF) ** (1.0 / 3.0)
+    mu_F_est = omega_ratio * (6.0 * NF) ** (1.0 / 3.0)        # spinless 3D-HO
     R_F = np.sqrt(2.0 * mu_F_est / max(mass_ratio * omega_ratio ** 2, 1e-6))
     if r_max is None:
-        r_max = 1.6 * max(R_B, R_F, 1.0)
+        r_max = 1.8 * max(R_B, R_F, 1.0)
 
-    r = np.linspace(1e-4, r_max, n_grid)
+    r = np.linspace(0.0, r_max, n_grid)
     V_B = 0.5 * r ** 2
     V_F = 0.5 * mass_ratio * omega_ratio ** 2 * r ** 2
 
-    # ---- initialize each species independently
-    boson_args = (np.zeros_like(r), V_B, gB, gBF, r)
-    mu_B = find_mu(NB, boson_density, *boson_args)
+    # Sanity threshold: a density this huge means we've blown up.
+    n_max_sane = 1e4 * max(NB, NF) / (r_max ** 3)
+
+    # --- initialise each species independently (g_BF turned off) -----------
+    mu_B = find_mu(NB, boson_density, np.zeros_like(r), V_B, gB, gBF, r)
     n_B = boson_density(mu_B, np.zeros_like(r), V_B, gB, gBF)
 
-    fermion_args = (np.zeros_like(r), V_F, mass_ratio, gBF, r)
-    mu_F = find_mu(NF, fermion_density, *fermion_args)
+    mu_F = find_mu(NF, fermion_density, np.zeros_like(r), V_F, mass_ratio, gBF, r)
     n_F = fermion_density(mu_F, np.zeros_like(r), V_F, mass_ratio, gBF)
 
-    history = []
+    # --- self-consistent loop (Jacobi: each species sees the *old* partner) -
+    status = 'unconverged'
+    delta = float('nan')
+    it = 0
     for it in range(max_iter):
         n_B_old, n_F_old = n_B.copy(), n_F.copy()
 
-        mu_B = find_mu(NB, boson_density, n_F, V_B, gB, gBF, r)
-        n_B_new = boson_density(mu_B, n_F, V_B, gB, gBF)
-        n_B = mixing * n_B_new + (1 - mixing) * n_B
-
-        mu_F = find_mu(NF, fermion_density, n_B, V_F, mass_ratio, gBF, r)
-        n_F_new = fermion_density(mu_F, n_B, V_F, mass_ratio, gBF)
-        n_F = mixing * n_F_new + (1 - mixing) * n_F
-
-        delta = (np.max(np.abs(n_B - n_B_old)) / max(np.max(n_B), 1e-15) +
-                 np.max(np.abs(n_F - n_F_old)) / max(np.max(n_F), 1e-15))
-        history.append(delta)
-        if delta < tol:
+        try:
+            mu_B = find_mu(NB, boson_density, n_F_old, V_B, gB, gBF, r)
+            n_B_new = boson_density(mu_B, n_F_old, V_B, gB, gBF)
+            mu_F = find_mu(NF, fermion_density, n_B_old, V_F, mass_ratio, gBF, r)
+            n_F_new = fermion_density(mu_F, n_B_old, V_F, mass_ratio, gBF)
+        except (ValueError, OverflowError, FloatingPointError):
+            status = 'collapsed'
             break
 
-    # ---- diagnostics
-    R_TF_B = r[np.where(n_B > 1e-6 * np.max(n_B))[0][-1]] if np.max(n_B) > 0 else 0.0
-    R_TF_F = r[np.where(n_F > 1e-6 * np.max(n_F))[0][-1]] if np.max(n_F) > 0 else 0.0
-    NB_check = integrate_radial(n_B, r)
-    NF_check = integrate_radial(n_F, r)
+        # runaway / blow-up detection
+        if (not np.all(np.isfinite(n_B_new))
+                or not np.all(np.isfinite(n_F_new))
+                or np.max(n_B_new) > n_max_sane
+                or np.max(n_F_new) > n_max_sane):
+            status = 'collapsed'
+            break
+
+        n_B = mixing * n_B_new + (1.0 - mixing) * n_B_old
+        n_F = mixing * n_F_new + (1.0 - mixing) * n_F_old
+
+        nB_scale = max(np.max(n_B), 1e-15)
+        nF_scale = max(np.max(n_F), 1e-15)
+        delta = (np.max(np.abs(n_B - n_B_old)) / nB_scale +
+                 np.max(np.abs(n_F - n_F_old)) / nF_scale)
+        if delta < tol:
+            status = 'converged'
+            break
+
+    # --- diagnostics ------------------------------------------------------
+    R_TF_B = cloud_radius(n_B, r)
+    R_TF_F = cloud_radius(n_F, r)
+    NB_check = integrate_radial(n_B, r) if status != 'collapsed' else float('nan')
+    NF_check = integrate_radial(n_F, r) if status != 'collapsed' else float('nan')
 
     return {
         'r': r, 'n_B': n_B, 'n_F': n_F,
         'V_B': V_B, 'V_F': V_F,
-        'mu_B': mu_B, 'mu_F': mu_F,
+        'mu_B': float(mu_B), 'mu_F': float(mu_F),
         'R_TF_B': R_TF_B, 'R_TF_F': R_TF_F,
         'n_B_0': float(n_B[0]), 'n_F_0': float(n_F[0]),
         'N_B': NB_check, 'N_F': NF_check,
-        'iterations': it + 1, 'converged': delta < tol,
+        'iterations': it + 1,
+        'status': status,
+        'converged': status == 'converged',
         'final_delta': float(delta),
     }
 
@@ -511,12 +574,28 @@ else:
                r"$n_B = \max((\mu_B - V_B - g_{BF}n_F)/g_B,0)$,  "
                r"$E_F[n_F] = \mu_F - V_F - g_{BF}n_B$")
 
-    # -- diagnostics row (before simulation runs)
-    det_M = gB * (2.0 / 3.0) * (6.0 * np.pi ** 2) ** (2.0 / 3.0) * 0  # placeholder
-    diag_col1, diag_col2, diag_col3 = st.columns(3)
+    # -- diagnostics row (before simulation runs) — gives the user a
+    # quick stability prediction so they know what to expect.
+    # Use non-interacting central fermion density to estimate ∂E_F/∂n_F.
+    _muF_est = omega_ratio * (6.0 * NF) ** (1.0 / 3.0)
+    _nF0_est = (1.0 / (6.0 * np.pi ** 2)) * (2.0 * mass_ratio * _muF_est) ** 1.5
+    if _nF0_est > 1e-12:
+        _dEF_dn = (6.0 * np.pi ** 2) ** (2.0 / 3.0) / (3.0 * mass_ratio) \
+                  * _nF0_est ** (-1.0 / 3.0)
+    else:
+        _dEF_dn = float('inf')
+    _gBF_max = float(np.sqrt(gB * _dEF_dn))   # linear stability bound on |g_BF|
+    diag_col1, diag_col2, diag_col3, diag_col4 = st.columns(4)
     diag_col1.metric("g_B", f"{gB:.4f}")
     diag_col2.metric("g_BF", f"{gBF:+.4f}")
     diag_col3.metric("m_F / m_B", f"{mass_ratio:.4f}")
+    diag_col4.metric("|g_BF| stable for ≲", f"{_gBF_max:.3f}",
+                     delta="unstable" if abs(gBF) > _gBF_max else "stable",
+                     delta_color="inverse" if abs(gBF) > _gBF_max else "normal",
+                     help="Linear-stability bound: |g_BF| < √(g_B·∂E_F/∂n_F) "
+                          "evaluated at the non-interacting central fermion density. "
+                          "Crossing it triggers mean-field collapse (g_BF<0) or "
+                          "phase separation (g_BF>0).")
 
     if run_btn:
         runs = []
@@ -532,7 +611,31 @@ else:
                 runs.append((f"g_BF = {gBF:+.4f}", solve_bf_mixture(
                     NB, NF, gB, gBF, mass_ratio, omega_ratio, n_grid=n_grid)))
 
-        # -- summary table
+        # -- status banner
+        bad = [(label, sol['status']) for label, sol in runs
+               if sol['status'] != 'converged']
+        if bad:
+            msgs = []
+            for label, status in bad:
+                if status == 'collapsed':
+                    msgs.append(f"**{label}**: mean-field collapse / phase separation "
+                                f"(densities diverged → unphysical region of parameter space).")
+                else:
+                    msgs.append(f"**{label}**: did not converge within iteration cap.")
+            st.warning("⚠️  " + "  \n".join(msgs)
+                       + "\n\nResults shown for these cases are unreliable. "
+                       + "Check the stability table at the bottom for the criterion "
+                       + "g_B·∂E_F/∂n_F > g_BF².")
+
+        # -- safe plot range (ignore NaN/Inf if collapse occurred)
+        def safe_max_y(sols):
+            vals = []
+            for _, s in sols:
+                for arr in (s['n_B'], s['n_F']):
+                    finite = arr[np.isfinite(arr)]
+                    if finite.size:
+                        vals.append(finite.max())
+            return max(vals) * 1.15 if vals else 1.0
         rows = []
         for label, sol in runs:
             rows.append({
@@ -542,7 +645,7 @@ else:
                                  0.0       if 'Non' in label else
                                  +abs(gBF)),
                 'iterations':    sol['iterations'],
-                'converged':     "✓" if sol['converged'] else "✗",
+                'status':        sol['status'],
                 'μ_B':           sol['mu_B'],
                 'μ_F':           sol['mu_F'],
                 'R_TF_B':        sol['R_TF_B'],
@@ -563,6 +666,12 @@ else:
         }
 
         # ---- plot 1 : density profiles ---------------------------------------
+        # Plot range: use cloud edge of converged runs, fallback to r_max.
+        good_radii = [max(s['R_TF_B'], s['R_TF_F']) for _, s in runs
+                      if s['status'] != 'collapsed']
+        x_lim = max(good_radii) * 1.15 + 0.2 if good_radii else float(runs[0][1]['r'][-1])
+        y_cap = safe_max_y(runs)
+
         if len(runs) == 1:
             fig, ax = plt.subplots(figsize=(7, 4.5))
             label, sol = runs[0]
@@ -570,23 +679,26 @@ else:
             ax.plot(sol['r'], sol['n_F'], color='#FB5607', lw=2.0, label=r"$n_F(r)$")
             ax.set_xlabel(r"$r / a_{\mathrm{ho},B}$")
             ax.set_ylabel("Density  (1 / $a_{\\mathrm{ho},B}^3$)")
-            ax.set_title(label)
+            title = label + (f"  [{sol['status']}]" if sol['status'] != 'converged' else "")
+            ax.set_title(title)
             ax.legend()
             ax.grid(True, alpha=0.3)
-            ax.set_xlim(0, max(sol['R_TF_B'], sol['R_TF_F']) * 1.15 + 0.1)
+            ax.set_xlim(0, x_lim)
+            ax.set_ylim(0, y_cap)
             fig.tight_layout()
             st.pyplot(fig)
         else:
             fig, axes = plt.subplots(1, 3, figsize=(15, 4.4), sharey=False)
-            r_max_plot = max(max(sol['R_TF_B'], sol['R_TF_F']) for _, sol in runs) * 1.15
             for (label, sol), ax in zip(runs, axes):
                 ax.plot(sol['r'], sol['n_B'], color='#3A86FF', lw=2.0,
                         label=r"$n_B(r)$")
                 ax.plot(sol['r'], sol['n_F'], color='#FB5607', lw=2.0,
                         label=r"$n_F(r)$")
                 ax.set_xlabel(r"$r / a_{\mathrm{ho},B}$")
-                ax.set_title(label, fontsize=10)
-                ax.set_xlim(0, r_max_plot)
+                title = label + (f"\n[{sol['status']}]" if sol['status'] != 'converged' else "")
+                ax.set_title(title, fontsize=10)
+                ax.set_xlim(0, x_lim)
+                ax.set_ylim(0, y_cap)
                 ax.grid(True, alpha=0.3)
                 ax.legend(fontsize=9)
             axes[0].set_ylabel(r"Density  (1 / $a_{\mathrm{ho},B}^3$)")
@@ -658,17 +770,19 @@ else:
                            mime="text/csv")
 
         # ---- stability remark -----------------------------------------------
-        # Stability criterion : g_B · ∂E_F/∂n_F  > g_BF²
-        # ∂E_F/∂n_F at fermion central density
+        # Stability criterion (project Eq. 6) :  g_B · ∂E_F/∂n_F  > g_BF²
+        # E_F = (6π²)^{2/3} n_F^{2/3} / (2 m_r) (in HO units), so
+        # ∂E_F/∂n_F = (6π²)^{2/3} / (3 m_r) · n_F^{-1/3}
+        # Equivalently:  ∂E_F/∂n_F = (2/3) E_F / n_F.
         st.subheader("Stability / phase-separation check")
         rows_stab = []
         for label, sol in runs:
             n_F0 = sol['n_F_0']
-            if n_F0 > 0:
-                dEF_dn = (1.0 / mass_ratio) * (np.pi ** 2) ** (2.0 / 3.0) \
-                         * (6.0 * n_F0) ** (2.0 / 3.0) / 3.0   # ∂E_F/∂n_F at center
+            if n_F0 > 1e-12:
+                dEF_dn = (6.0 * np.pi ** 2) ** (2.0 / 3.0) / (3.0 * mass_ratio) \
+                         * n_F0 ** (-1.0 / 3.0)
             else:
-                dEF_dn = np.inf
+                dEF_dn = float('inf')                          # vacuum is trivially stable
             g_eff_used = (gBF if not auto_compare else (
                           -abs(gBF) if 'Attractive' in label else
                           0.0       if 'Non' in label else
@@ -676,21 +790,30 @@ else:
             lhs = gB * dEF_dn
             rhs = g_eff_used ** 2
             stable = lhs > rhs
+            if sol['status'] == 'collapsed':
+                verdict = "✗ collapsed (numerical run-away)"
+            elif sol['status'] == 'unconverged':
+                verdict = "⚠ did not converge"
+            elif stable:
+                verdict = "✓ stable"
+            else:
+                kind = "phase separation" if g_eff_used > 0 else "mean-field collapse"
+                verdict = f"✗ unstable → {kind}"
             rows_stab.append({
                 'case':            label,
                 'g_BF':            g_eff_used,
                 "g_B · ∂E_F/∂n_F": lhs,
                 "g_BF²":           rhs,
-                "stable?":         "✓" if stable else "✗ (collapse / phase separation)",
+                "verdict":         verdict,
             })
         st.dataframe(pd.DataFrame(rows_stab).style.format({
             'g_BF':            "{:+.4f}",
-            'g_B · ∂E_F/∂n_F': "{:.4f}",
-            'g_BF²':           "{:.4f}",
+            'g_B · ∂E_F/∂n_F': "{:.4g}",
+            'g_BF²':           "{:.4g}",
         }), use_container_width=True, hide_index=True)
 
-        st.caption("Stability requires  g_B·∂E_F/∂n_F > g_BF² (positive determinant of "
-                   "the 2×2 stability matrix). Violation → phase separation (g_BF>0) "
+        st.caption("Stability requires  g_B·∂E_F/∂n_F > g_BF²  (positive determinant of "
+                   "the 2×2 stability matrix).  Violation → phase separation (g_BF>0) "
                    "or mean-field collapse (g_BF<0).")
 
 
