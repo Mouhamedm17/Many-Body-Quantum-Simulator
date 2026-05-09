@@ -599,10 +599,15 @@ else:
 
     if run_btn:
         runs = []
+        # Use the user's |g_BF| as the comparison amplitude when nonzero,
+        # otherwise pick something safely inside the stability window so
+        # the comparison itself doesn't always trigger collapse for
+        # heavy fermions.
+        amp = abs(gBF) if gBF != 0 else min(0.05, 0.4 * _gBF_max)
         if auto_compare:
-            for label, g in [("Attractive (g_BF = -|g|)", -abs(gBF) if gBF != 0 else -0.05),
+            for label, g in [(f"Attractive (g_BF = -{amp:.3f})", -amp),
                              ("Non-interacting (g_BF = 0)", 0.0),
-                             ("Repulsive (g_BF = +|g|)", abs(gBF) if gBF != 0 else +0.05)]:
+                             (f"Repulsive (g_BF = +{amp:.3f})", +amp)]:
                 with st.spinner(f"Solving {label}..."):
                     runs.append((label, solve_bf_mixture(
                         NB, NF, gB, g, mass_ratio, omega_ratio, n_grid=n_grid)))
@@ -627,33 +632,45 @@ else:
                        + "Check the stability table at the bottom for the criterion "
                        + "g_B·∂E_F/∂n_F > g_BF².")
 
-        # -- safe plot range (ignore NaN/Inf if collapse occurred)
+        # -- safe plot range: scale axes from converged runs ONLY so a
+        # collapsed case (with densities in the 1e5+ range) doesn't squash
+        # the converged plots into invisible flat lines.
         def safe_max_y(sols):
             vals = []
+            for _, s in sols:
+                if s['status'] != 'converged':
+                    continue
+                for arr in (s['n_B'], s['n_F']):
+                    finite = arr[np.isfinite(arr)]
+                    if finite.size:
+                        vals.append(finite.max())
+            if vals:
+                return max(vals) * 1.15
+            # Fallback when nothing converged: still pick a finite scale.
             for _, s in sols:
                 for arr in (s['n_B'], s['n_F']):
                     finite = arr[np.isfinite(arr)]
                     if finite.size:
                         vals.append(finite.max())
-            return max(vals) * 1.15 if vals else 1.0
+            return (max(vals) * 1.15) if vals else 1.0
         rows = []
         for label, sol in runs:
+            collapsed = sol['status'] == 'collapsed'
             rows.append({
                 'case':          label,
-                'g_BF':          gBF if not auto_compare else (
-                                 -abs(gBF) if 'Attractive' in label else
-                                 0.0       if 'Non' in label else
-                                 +abs(gBF)),
+                'g_BF':          (-amp if 'Attractive' in label else
+                                  +amp if 'Repulsive' in label else
+                                  0.0  if 'Non-int' in label else gBF),
                 'iterations':    sol['iterations'],
                 'status':        sol['status'],
-                'μ_B':           sol['mu_B'],
-                'μ_F':           sol['mu_F'],
+                'μ_B':           float('nan') if collapsed else sol['mu_B'],
+                'μ_F':           float('nan') if collapsed else sol['mu_F'],
                 'R_TF_B':        sol['R_TF_B'],
                 'R_TF_F':        sol['R_TF_F'],
-                'n_B(0)':        sol['n_B_0'],
-                'n_F(0)':        sol['n_F_0'],
-                'N_B (check)':   sol['N_B'],
-                'N_F (check)':   sol['N_F'],
+                'n_B(0)':        float('nan') if collapsed else sol['n_B_0'],
+                'n_F(0)':        float('nan') if collapsed else sol['n_F_0'],
+                'N_B (check)':   float('nan') if collapsed else sol['N_B'],
+                'N_F (check)':   float('nan') if collapsed else sol['N_F'],
             })
         df = pd.DataFrame(rows)
         # nicer formatting
@@ -690,46 +707,72 @@ else:
         else:
             fig, axes = plt.subplots(1, 3, figsize=(15, 4.4), sharey=False)
             for (label, sol), ax in zip(runs, axes):
-                ax.plot(sol['r'], sol['n_B'], color='#3A86FF', lw=2.0,
-                        label=r"$n_B(r)$")
-                ax.plot(sol['r'], sol['n_F'], color='#FB5607', lw=2.0,
-                        label=r"$n_F(r)$")
+                if sol['status'] == 'converged':
+                    ax.plot(sol['r'], sol['n_B'], color='#3A86FF', lw=2.0,
+                            label=r"$n_B(r)$")
+                    ax.plot(sol['r'], sol['n_F'], color='#FB5607', lw=2.0,
+                            label=r"$n_F(r)$")
+                    ax.legend(fontsize=9)
+                else:
+                    # Don't plot the divergent profile — annotate the panel.
+                    ax.text(0.5, 0.5, "MEAN-FIELD\nCOLLAPSE",
+                            ha='center', va='center', transform=ax.transAxes,
+                            fontsize=14, color='#B00020',
+                            bbox=dict(boxstyle='round', facecolor='#FFE5E5',
+                                      edgecolor='#B00020'))
                 ax.set_xlabel(r"$r / a_{\mathrm{ho},B}$")
-                title = label + (f"\n[{sol['status']}]" if sol['status'] != 'converged' else "")
+                title = label + (f"\n[{sol['status']}]"
+                                 if sol['status'] != 'converged' else "")
                 ax.set_title(title, fontsize=10)
                 ax.set_xlim(0, x_lim)
                 ax.set_ylim(0, y_cap)
                 ax.grid(True, alpha=0.3)
-                ax.legend(fontsize=9)
             axes[0].set_ylabel(r"Density  (1 / $a_{\mathrm{ho},B}^3$)")
             fig.tight_layout()
             st.pyplot(fig)
 
         # ---- plot 2 : overlay all profiles + central density vs g_BF ---------
         fig2, (ax_a, ax_b) = plt.subplots(1, 2, figsize=(13, 4.4))
-        colors = plt.cm.coolwarm(np.linspace(0.15, 0.85, max(len(runs), 3)))
+        good_runs = [(label, sol) for label, sol in runs
+                     if sol['status'] == 'converged']
+        colors = plt.cm.coolwarm(np.linspace(0.15, 0.85,
+                                              max(len(good_runs), 3)))
 
-        for (label, sol), c in zip(runs, colors):
+        for (label, sol), c in zip(good_runs, colors):
             ax_a.plot(sol['r'], sol['n_B'], color=c, lw=1.8,
                       label=label.split('(')[0].strip(), linestyle='-')
             ax_a.plot(sol['r'], sol['n_F'], color=c, lw=1.8, linestyle='--')
         ax_a.set_xlabel(r"$r / a_{\mathrm{ho},B}$")
         ax_a.set_ylabel("Density")
         ax_a.set_title(r"Density profiles  (solid: $n_B$, dashed: $n_F$)")
-        ax_a.legend(fontsize=8)
+        ax_a.set_xlim(0, x_lim)
+        ax_a.set_ylim(0, y_cap)
+        if good_runs:
+            ax_a.legend(fontsize=8)
+        else:
+            ax_a.text(0.5, 0.5, "no converged runs",
+                      transform=ax_a.transAxes, ha='center', va='center',
+                      color='#B00020')
         ax_a.grid(True, alpha=0.3)
 
         # central density and TF radii vs g_BF (only meaningful in compare mode)
         if auto_compare:
-            g_list = [r['g_BF'] for r in rows]
-            ax_b.plot(g_list, [r['n_B(0)'] for r in rows], 'o-',
-                      color='#3A86FF', label=r"$n_B(0)$")
-            ax_b.plot(g_list, [r['n_F(0)'] for r in rows], 's-',
-                      color='#FB5607', label=r"$n_F(0)$")
+            converged_rows = [r for r in rows
+                              if r['status'] == 'converged']
+            if converged_rows:
+                g_list = [r['g_BF'] for r in converged_rows]
+                ax_b.plot(g_list, [r['n_B(0)'] for r in converged_rows], 'o-',
+                          color='#3A86FF', label=r"$n_B(0)$")
+                ax_b.plot(g_list, [r['n_F(0)'] for r in converged_rows], 's-',
+                          color='#FB5607', label=r"$n_F(0)$")
+                ax_b.legend()
+            else:
+                ax_b.text(0.5, 0.5, "no converged runs",
+                          transform=ax_b.transAxes, ha='center', va='center',
+                          color='#B00020')
             ax_b.set_xlabel(r"$g_{BF}$")
             ax_b.set_ylabel("Central density")
             ax_b.set_title(r"Central density vs $g_{BF}$")
-            ax_b.legend()
             ax_b.grid(True, alpha=0.3)
         else:
             sol = runs[0][1]
@@ -737,13 +780,16 @@ else:
                       label=r"$V_B(r)$")
             ax_b.plot(sol['r'], sol['V_F'], color='#FB5607', lw=1.5,
                       label=r"$V_F(r)$")
-            ax_b.axhline(sol['mu_B'], color='#3A86FF', lw=1.0, linestyle=':',
-                         label=fr"$\mu_B$={sol['mu_B']:.2f}")
-            ax_b.axhline(sol['mu_F'], color='#FB5607', lw=1.0, linestyle=':',
-                         label=fr"$\mu_F$={sol['mu_F']:.2f}")
+            if np.isfinite(sol['mu_B']) and abs(sol['mu_B']) < 1e3:
+                ax_b.axhline(sol['mu_B'], color='#3A86FF', lw=1.0, linestyle=':',
+                             label=fr"$\mu_B$={sol['mu_B']:.2f}")
+            if np.isfinite(sol['mu_F']) and abs(sol['mu_F']) < 1e3:
+                ax_b.axhline(sol['mu_F'], color='#FB5607', lw=1.0, linestyle=':',
+                             label=fr"$\mu_F$={sol['mu_F']:.2f}")
             ax_b.set_xlabel(r"$r / a_{\mathrm{ho},B}$")
             ax_b.set_ylabel("Energy")
             ax_b.set_title("Trap potentials and chemical potentials")
+            ax_b.set_xlim(0, x_lim)
             ax_b.legend(fontsize=8)
             ax_b.grid(True, alpha=0.3)
 
